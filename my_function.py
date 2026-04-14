@@ -17,6 +17,7 @@ from sklearn.preprocessing import StandardScaler
 import sample_functions
 import warnings
 from dcekit.variable_selection import cvpfi
+from sklearn.neighbors import NearestNeighbors
 from sklearn import tree
 from sklearn.model_selection import KFold
 import math
@@ -301,8 +302,11 @@ def double_cross_validation_regression(
     y,
     model_type,
     outer_fold_number=10,
-    fold_number=5
-):
+    fold_number=5):
+    
+    # ここに追加！！
+    if model_type.endswith("_ensemble"):
+        raise ValueError("DCVではensembleは使えません")
 
     estimated_y = pd.Series(index=y.index, dtype=float)
 
@@ -334,7 +338,7 @@ def double_cross_validation_regression(
             fold_number=fold_number
         )
 
-        model = results[0]
+        model = results["model"]
 
         # 予測（逆スケーリング）
         y_pred = model.predict(autoscaled_x_test).ravel()
@@ -423,9 +427,13 @@ def prepare_regression_data(dataset, number_of_test_samples, target_column_index
                                                         random_state=random_number)
 
     # オートスケーリング
+    std = x_train.std()
+    std[std == 0] = 1
+
+    autoscaled_x_train = (x_train - x_train.mean()) / std
+    autoscaled_x_test  = (x_test - x_train.mean()) / std
     autoscaled_y_train = (y_train - y_train.mean()) / y_train.std()
-    autoscaled_x_train = (x_train - x_train.mean()) / x_train.std()
-    autoscaled_x_test = (x_test - x_train.mean()) / x_train.std()
+  
 
     return x_train, x_test, y_train, y_test, autoscaled_x_train, autoscaled_y_train, autoscaled_x_test
 
@@ -455,6 +463,285 @@ def prepare_regression_data_for_dcv(dataset, target_column_index=0):
     y = dataset.iloc[:, target_column_index]
     x = dataset.drop(dataset.columns[target_column_index], axis=1)
     return x, y
+
+
+
+def calculate_ad_knn(autoscaled_x_train,autoscaled_x_test,k_in_knn=5,
+                     rate_of_training_samples_inside_ad=0.8,save_csv=None):
+
+    # =========================
+    # モデル構築
+    # =========================
+    ad_model = NearestNeighbors(n_neighbors=k_in_knn, metric='euclidean')
+    ad_model.fit(autoscaled_x_train)
+
+    # =========================
+    # train の距離
+    # =========================
+    knn_distance_train, _ = ad_model.kneighbors(autoscaled_x_train,n_neighbors=k_in_knn + 1)
+    knn_distance_train = pd.DataFrame(knn_distance_train, index=autoscaled_x_train.index)
+    mean_distance_train = pd.DataFrame(knn_distance_train.iloc[:, 1:].mean(axis=1),
+                                       columns=['mean_of_knn_distance'])
+
+    # =========================
+    # 閾値決定
+    # =========================
+    sorted_dist = mean_distance_train.iloc[:, 0].sort_values()
+    ad_threshold = sorted_dist.iloc[round(len(sorted_dist) * rate_of_training_samples_inside_ad) - 1]
+
+    # =========================
+    # train 判定
+    # =========================
+    inside_ad_flag_train = (mean_distance_train <= ad_threshold)
+    inside_ad_flag_train.columns = ['inside_ad_flag']
+
+    # =========================
+    # test の距離
+    # =========================
+    knn_distance_test, _ = ad_model.kneighbors(autoscaled_x_test)
+    knn_distance_test = pd.DataFrame(knn_distance_test, index=autoscaled_x_test.index)
+    mean_distance_test = pd.DataFrame(knn_distance_test.mean(axis=1),columns=['mean_of_knn_distance'])
+
+    # =========================
+    # test 判定
+    # =========================
+    inside_ad_flag_test = (mean_distance_test <= ad_threshold)
+    inside_ad_flag_test.columns = ['inside_ad_flag']
+
+    # =========================
+    # 保存（任意）
+    # =========================
+    if save_csv:
+        mean_distance_train.to_csv('ad_mean_distance_train.csv')
+        mean_distance_test.to_csv('ad_mean_distance_test.csv')
+        inside_ad_flag_train.to_csv('ad_inside_flag_train.csv')
+        inside_ad_flag_test.to_csv('ad_inside_flag_test.csv')
+
+    # =========================
+    # まとめて返す
+    # =========================
+    return {
+        "ad_threshold": ad_threshold,
+        "mean_distance_train": mean_distance_train,
+        "mean_distance_test": mean_distance_test,
+        "inside_ad_flag_train": inside_ad_flag_train,
+        "inside_ad_flag_test": inside_ad_flag_test
+    }
+
+def calculate_ad_ocsvm(autoscaled_x_train, autoscaled_x_test,
+                      ocsvm_nu=0.045,
+                      ocsvm_gammas=2 ** np.arange(-20, 11, dtype=float),
+                      save_csv=None):
+
+    from scipy.spatial.distance import cdist
+
+    # =========================
+    # γ最適化（グラム行列分散最大化）
+    # =========================
+    variance_of_gram_matrix = list()
+    for ocsvm_gamma in ocsvm_gammas:
+        gram_matrix = np.exp(
+            -ocsvm_gamma * cdist(autoscaled_x_train, autoscaled_x_train, metric='sqeuclidean'))
+        variance_of_gram_matrix.append(gram_matrix.var(ddof=1))
+    optimal_ocsvm_gamma = ocsvm_gammas[np.argmax(variance_of_gram_matrix)]
+
+    print('最適化された gamma :', optimal_ocsvm_gamma)
+
+    # =========================
+    # モデル構築
+    # =========================
+    ad_model = svm.OneClassSVM(kernel='rbf', gamma=optimal_ocsvm_gamma, nu=ocsvm_nu)
+    ad_model.fit(autoscaled_x_train)
+
+    # =========================
+    # train のデータ密度
+    # =========================
+    data_density_train = ad_model.decision_function(autoscaled_x_train)
+    data_density_train = pd.DataFrame(data_density_train, index=autoscaled_x_train.index, 
+                                      columns=['ocsvm_data_density'])
+    number_of_support_vectors = len(ad_model.support_)
+    number_of_outliers_in_training_data = (data_density_train < 0).sum().iloc[0]
+    print('\nトレーニングデータにおけるサポートベクター数 :', number_of_support_vectors)
+    print('トレーニングデータにおけるサポートベクターの割合 :', number_of_support_vectors / autoscaled_x_train.shape[0])
+    print('\nトレーニングデータにおける外れサンプル数 :', number_of_outliers_in_training_data)
+    print('トレーニングデータにおける外れサンプルの割合 :', number_of_outliers_in_training_data / autoscaled_x_train.shape[0])
+   
+    inside_ad_flag_train = data_density_train >= 0
+    inside_ad_flag_train.columns = ['inside_ad_flag']
+
+    # =========================
+    # test のデータ密度
+    # =========================
+    data_density_test = ad_model.decision_function(autoscaled_x_test)
+    data_density_test = pd.DataFrame(
+        data_density_test,
+        index=autoscaled_x_test.index,
+        columns=['ocsvm_data_density']
+    )
+    number_of_outliers_in_test_data = (data_density_test < 0).sum().iloc[0]
+    print('\nテストデータにおける外れサンプル数 :', number_of_outliers_in_test_data)
+    print('テストデータにおける外れサンプルの割合 :', number_of_outliers_in_test_data / autoscaled_x_test.shape[0])
+    
+    inside_ad_flag_test = data_density_test >= 0
+    inside_ad_flag_test.columns = ['inside_ad_flag']
+
+    # =========================
+    # 保存
+    # =========================
+    if save_csv:
+        data_density_train.to_csv('ocsvm_data_density_train.csv')
+        data_density_test.to_csv('ocsvm_data_density_test.csv')
+        inside_ad_flag_train.to_csv('ocsvm_inside_flag_train.csv')
+        inside_ad_flag_test.to_csv('ocsvm_inside_flag_test.csv')
+
+    # =========================
+    # まとめて返す
+    # =========================
+    return {
+        "ocsvm_gamma": optimal_ocsvm_gamma,
+        "data_density_train": data_density_train,
+        "data_density_test": data_density_test,
+        "inside_ad_flag_train": inside_ad_flag_train,
+        "inside_ad_flag_test": inside_ad_flag_test
+    }
+def calculate_ad(method="knn",
+                 autoscaled_x_train=None,
+                 autoscaled_x_test=None,
+                 k_in_knn=5,
+                 rate_of_training_samples_inside_ad=0.8,
+                 ocsvm_nu=0.045,
+                 ocsvm_gammas=2 ** np.arange(-20, 11, dtype=float),
+                 save_csv=None):
+
+    # =========================
+    # kNN
+    # =========================
+    if method == "knn":
+
+        return calculate_ad_knn(
+            autoscaled_x_train=autoscaled_x_train,
+            autoscaled_x_test=autoscaled_x_test,
+            k_in_knn=k_in_knn,
+            rate_of_training_samples_inside_ad=rate_of_training_samples_inside_ad,
+            save_csv=save_csv
+        )
+
+    # =========================
+    # OCSVM
+    # =========================
+    elif method == "ocsvm":
+
+        return calculate_ad_ocsvm(
+            autoscaled_x_train=autoscaled_x_train,
+            autoscaled_x_test=autoscaled_x_test,
+            ocsvm_nu=ocsvm_nu,
+            ocsvm_gammas=ocsvm_gammas,
+            save_csv=save_csv
+        )
+
+    # =========================
+    # error
+    # =========================
+    else:
+        raise ValueError(f"Unknown AD method: {method}")
+        
+def evaluate_subset(y_true, y_pred, name=""):
+    r2 = 1 - sum((y_true - y_pred) ** 2) / sum((y_true - y_true.mean()) ** 2)
+    rmse = (sum((y_true - y_pred) ** 2) / len(y_true)) ** 0.5
+    mae = sum(abs(y_true - y_pred)) / len(y_true)
+
+    print(f"\n=== {name} ===")
+    print(f"n_samples: {len(y_true)}")
+    print(f"r2   : {float(r2)}")
+    print(f"RMSE : {float(rmse)}")
+    print(f"MAE  : {float(mae)}")
+    
+def run_ensemble_regression_pipeline(
+        base_model_type,
+        x_train, x_test, y_train, y_test,
+        autoscaled_x_train, autoscaled_y_train, autoscaled_x_test,
+        fold_number,
+        number_of_submodels=3,
+        rate_of_selected_x_variables=0.7
+    ):
+
+    number_of_x_variables = int(np.ceil(x_train.shape[1] * rate_of_selected_x_variables))
+
+    submodels = []
+    selected_x_variable_numbers = []
+    estimated_y_test_all = pd.DataFrame(index=x_test.index)
+
+    for i in range(number_of_submodels):
+        print(f"{i+1}/{number_of_submodels}")
+
+        # =========================
+        # 変数ランダム選択（元コード互換）
+        # =========================
+        random_x_variables = np.random.rand(x_train.shape[1])
+        selected_idx = random_x_variables.argsort()[:number_of_x_variables]
+
+        selected_x_variable_numbers.append(selected_idx)
+
+        x_tr = x_train.iloc[:, selected_idx]
+        x_te = x_test.iloc[:, selected_idx]
+
+        auto_x_tr = autoscaled_x_train.iloc[:, selected_idx]
+        auto_x_te = autoscaled_x_test.iloc[:, selected_idx]
+
+        # =========================
+        # モデル構築
+        # =========================
+        result = run_regression_pipeline(
+        model_type=base_model_type,
+        x_train=x_tr,
+        x_test=x_te,
+        y_train=y_train,
+        y_test=y_test,
+        autoscaled_x_train=auto_x_tr,
+        autoscaled_y_train=autoscaled_y_train,
+        autoscaled_x_test=auto_x_te,
+        fold_number=fold_number,
+        run_cvpfi_flag=False)
+
+        model = result["model"]
+
+        submodels.append(model)
+
+        # =========================
+        # 予測（スケール戻し）
+        # =========================
+        y_pred_scaled = model.predict(auto_x_te).ravel()
+        y_pred = y_pred_scaled * y_train.std() + y_train.mean()
+
+        estimated_y_test_all[f"model_{i}"] = y_pred
+
+    # =========================
+    # 集約（元コード完全一致）
+    # =========================
+    y_mean = pd.Series(
+        estimated_y_test_all.median(axis=1),
+        index=x_test.index)
+
+    y_std = pd.Series(
+        estimated_y_test_all.std(axis=1),
+        index=x_test.index)
+
+    # =========================
+    # 可視化
+    # =========================
+    plt.rcParams['font.size'] = 18
+
+    plt.scatter(y_std, abs(y_test - y_mean), c='blue')
+    plt.xlabel('std. of estimated y')
+    plt.ylabel('absolute error of y')
+    plt.show()
+
+    return {
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "submodels": submodels,
+        "selected_x_variable_numbers": selected_x_variable_numbers
+    }
 
 # =========================
 # PLS
@@ -526,6 +813,8 @@ def run_pls_pipeline(x_train, x_test, y_train, y_test, autoscaled_x_train, autos
     # 性能チェック
     sample_functions.estimation_and_performance_check_in_regression_train_and_test(model, autoscaled_x_train, y_train,
                                                                                    autoscaled_x_test, y_test)
+    # ★これを追加
+    cvpfi_df = None
     if run_cvpfi_flag:
         cvpfi_df=run_cvpfi_analysis(
                         model,
@@ -579,6 +868,8 @@ def run_svr_pipeline(x_train, x_test, y_train, y_test, autoscaled_x_train, autos
     # 性能チェック
     sample_functions.estimation_and_performance_check_in_regression_train_and_test(model, autoscaled_x_train, y_train,
                                                                                    autoscaled_x_test, y_test)
+    
+    cvpfi_df = None
     if run_cvpfi_flag:
         cvpfi_df=run_cvpfi_analysis(
             model,
@@ -781,13 +1072,37 @@ def run_rf_pipeline(x_train, x_test, y_train, y_test, autoscaled_x_train, autosc
     return model
 
 def run_regression_pipeline(
-    model_type,
-    x_train, x_test, y_train, y_test,
-    autoscaled_x_train, autoscaled_y_train, autoscaled_x_test,
-    fold_number,
-    run_cvpfi_flag=True
-):
+        model_type,
+        x_train, x_test, y_train, y_test,
+        autoscaled_x_train, autoscaled_y_train, autoscaled_x_test,
+        fold_number,
+        run_cvpfi_flag=True
+    ):
 
+    # =========================
+    # アンサンブル分岐
+    # =========================
+    if model_type.endswith("_ensemble"):
+        base = model_type.replace("_ensemble", "")
+
+        ensemble_results = run_ensemble_regression_pipeline(
+            base,
+            x_train, x_test, y_train, y_test,
+            autoscaled_x_train, autoscaled_y_train, autoscaled_x_test,
+            fold_number
+        )
+
+        return {
+            "model": ensemble_results["submodels"],  # 複数モデル
+            "estimated_y_test": ensemble_results["y_mean"],
+            "y_std": ensemble_results["y_std"],
+            "cvpfi": None,
+            "type": "ensemble"
+        }
+
+    # =========================
+    # 通常モデル
+    # =========================
     model_dict = {
         "pls": run_pls_pipeline,
         "svr": run_svr_pipeline
@@ -796,19 +1111,43 @@ def run_regression_pipeline(
     if model_type not in model_dict:
         raise ValueError(f"[Regression] Unknown model_type: {model_type}")
 
-    return model_dict[model_type](
+    results = model_dict[model_type](
         x_train, x_test, y_train, y_test,
         autoscaled_x_train, autoscaled_y_train, autoscaled_x_test,
         fold_number,
         run_cvpfi_flag
     )
 
+    # =========================
+    # 戻り値の吸収
+    # =========================
+    if model_type == "pls":
+        model, cvpfi_df, coef = results
+    else:  # svr
+        model, cvpfi_df = results
+        coef = None
+
+    # =========================
+    # 予測（統一）
+    # =========================
+    estimated_y_test = model.predict(autoscaled_x_test).ravel()
+    estimated_y_test = estimated_y_test * y_train.std() + y_train.mean()
+
+    return {
+        "model": model,
+        "estimated_y_test": pd.Series(estimated_y_test, index=x_test.index),
+        "y_std": None,
+        "cvpfi": cvpfi_df,
+        "coef": coef,
+        "type": "single"
+    }
+
 def run_classification_pipeline(
     model_type,
     x_train, x_test, y_train, y_test,
     autoscaled_x_train, autoscaled_x_test,
     fold_number
-):
+    ):
 
     model_dict = {
         "svc": run_svc_pipeline,
@@ -905,83 +1244,125 @@ def run_cvpfi_analysis(model,
 
 
 # =========================
-# 実行部
+# 実行モード選択
 # =========================
+mode = "dcv_regression"  
 
-# 1. データの読み込み
-dataset = pd.read_csv('./sample_data/boston.csv', index_col=0)
-number_of_test_samples = 50
+# =========================
+# 共通設定
+# =========================
 fold_number   = 5
-random_number = 21
+random_number = 99
+number_of_test_samples = 150
 
-# 2. 前処理の実行
-x_train, x_test, y_train, y_test, autoscaled_x_train, autoscaled_y_train, autoscaled_x_test = \
-    prepare_regression_data(dataset, number_of_test_samples,add_non_linear_flag=False,random_number=random_number)
-
-# 3. 各モデルの実行(回帰分析)
-
-# model = run_regression_pipeline(
-#     model_type="svr",
-#     x_train=x_train,
-#     x_test=x_test,
-#     y_train=y_train,
-#     y_test=y_test,
-#     autoscaled_x_train=autoscaled_x_train,
-#     autoscaled_y_train=autoscaled_y_train,
-#     autoscaled_x_test=autoscaled_x_test,
-#     fold_number=fold_number
-# )
-
-# x,y = prepare_regression_data_for_dcv(dataset, target_column_index=0)
-# =========================
-# DCV実行（
-# estimated_y = double_cross_validation_regression(
-#                     run_pipeline_func=run_regression_pipeline,  # ←変更
-#                     x=x,
-#                     y=y,
-#                     model_type="svr",                # ←追加
-#                     outer_fold_number=3,
-#                     fold_number=fold_number)
-
-# evaluate_dcv(y, estimated_y)
-
-
-dataset = pd.read_csv('./sample_data/iris.csv', index_col=0)
-# # 2 クラス 1 (positive), -1 (negative)  にします
-# dataset.iloc[0:100, 0] = 'positive'  # setosa と versicolor を 1 (positive) のクラスに
-# dataset.iloc[100:, 0] = 'negative'  # virginica を -1 (negative) のクラスに
-
-
-# データ準備
-x_train, x_test, y_train, y_test, autoscaled_x_train, autoscaled_x_test = \
-    prepare_classification_data(dataset,number_of_test_samples,random_number=random_number)
-
-# # 3. 各モデルの実行(分類分析)
-model = run_classification_pipeline(
-    model_type="rf",
-    x_train=x_train,
-    x_test=x_test,
-    y_train=y_train,
-    y_test=y_test,
-    autoscaled_x_train=autoscaled_x_train,
-    autoscaled_x_test=autoscaled_x_test,
-    fold_number=fold_number
-)
 
 # =========================
-# 実行
+# 可視化モード
 # =========================
+if mode == "visualization":
 
-# plt.rcParams['font.size'] = 20
+    dataset = pd.read_csv('./sample_data/iris_without_species.csv', index_col=0)
 
-# dataset = pd.read_csv('./sample_data/iris_without_species.csv', index_col=0)
+    plot_hist(dataset)
+    plot_box(dataset)
+    plot_scatter(dataset, var1=1, var2=2)
 
-# plot_hist(dataset)
-# plot_box(dataset)
-# plot_scatter(dataset, var1=1, var2=2)
+    corr = plot_corr_heatmap(dataset)
 
-# corr = plot_corr_heatmap(dataset)
+    results_pca  = run_pca_pipeline(dataset)
+    results_tsne = run_tsne_pipeline(dataset)
 
-# results_pca  = run_pca_pipeline(dataset)
-# results_tsne = run_tsne_pipeline(dataset)
 
+# =========================
+# 回帰
+# =========================
+elif mode == "regression":
+
+    dataset = pd.read_csv('./sample_data/boston.csv', index_col=0)
+
+    x_train, x_test, y_train, y_test, autoscaled_x_train, autoscaled_y_train, autoscaled_x_test = \
+        prepare_regression_data(dataset, number_of_test_samples,
+                                add_non_linear_flag=False,
+                                random_number=random_number)
+
+    results = run_regression_pipeline(
+        model_type="pls_ensemble",
+        x_train=x_train,
+        x_test=x_test,
+        y_train=y_train,
+        y_test=y_test,
+        autoscaled_x_train=autoscaled_x_train,
+        autoscaled_y_train=autoscaled_y_train,
+        autoscaled_x_test=autoscaled_x_test,
+        fold_number=fold_number
+    )
+
+    # アンサンブル対応
+    if results["type"] == "ensemble":
+        y_pred = results["estimated_y_test"]
+    else:
+        model = results["model"]
+        y_pred = model.predict(autoscaled_x_test).ravel()
+        y_pred = y_pred * y_train.std() + y_train.mean()
+
+    # AD
+    ad_results = calculate_ad(
+        method="knn",
+        autoscaled_x_train=autoscaled_x_train,
+        autoscaled_x_test=autoscaled_x_test)
+    inside_test = ad_results["inside_ad_flag_test"].iloc[:, 0]
+
+    # 分割評価
+    evaluate_subset(y_test[inside_test], y_pred[inside_test], "AD inside")
+    evaluate_subset(y_test[~inside_test], y_pred[~inside_test], "AD outside")
+
+
+# =========================
+# 分類
+# =========================
+elif mode == "classification":
+
+    dataset = pd.read_csv('./sample_data/iris.csv', index_col=0)
+
+    x_train, x_test, y_train, y_test, autoscaled_x_train, autoscaled_x_test = \
+        prepare_classification_data(dataset,
+                                    number_of_test_samples,
+                                    random_number=random_number)
+
+    model = run_classification_pipeline(
+        model_type="rf",
+        x_train=x_train,
+        x_test=x_test,
+        y_train=y_train,
+        y_test=y_test,
+        autoscaled_x_train=autoscaled_x_train,
+        autoscaled_x_test=autoscaled_x_test,
+        fold_number=fold_number)
+
+
+# =========================
+# DCV 回帰
+# =========================
+elif mode == "dcv_regression":
+
+    dataset = pd.read_csv('./sample_data/boston.csv', index_col=0)
+
+    x, y = prepare_regression_data_for_dcv(dataset)
+
+    estimated_y = double_cross_validation_regression(
+        run_pipeline_func=run_regression_pipeline,
+        x=x,
+        y=y,
+        model_type="svr",
+        outer_fold_number=5,
+        fold_number=fold_number
+    )
+
+    evaluate_dcv(y, estimated_y)
+
+
+# =========================
+# エラー
+# =========================
+else:
+    raise ValueError("Unknown mode")
